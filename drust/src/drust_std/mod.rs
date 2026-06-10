@@ -88,6 +88,7 @@ pub async fn drust_main(
         } else if app == "kv" {
             app::kv::run().await;
         } else if app == "sn" {
+            #[cfg(feature = "socialnet")]
             app::socialnet::run().await;
         } else {
             panic!("unknown app");

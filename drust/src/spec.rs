@@ -1,6 +1,11 @@
 use core::panic;
 
-use crate::{app::{dataframe::prelude::{AnyType, Chunk, DataType, CHUNK_SIZE}, kv::entry::GlobalEntry, socialnet::media::Image}, drust_std::{alloc::*, collections::dvec::DVec, primitives::*}, exclude};
+use crate::{app::{dataframe::prelude::{AnyType, Chunk, DataType, CHUNK_SIZE}, kv::entry::GlobalEntry}, drust_std::{alloc::*, collections::dvec::DVec, primitives::*}, exclude};
+
+#[cfg(feature = "socialnet")]
+use crate::app::socialnet::media::Image;
+#[cfg(not(feature = "socialnet"))]
+use crate::app::socialnet_stub::media::Image;
 
 // use crate::{app::{dataframe::prelude::{Chunk, CHUNK_SIZE}, kvstore::GlobalEntry, sequential::{CHUNK_NUM, ELEMENT_UNIT_NUM}, socialnet::utils::FRAME_SIZE}, drust_std::alloc::LOCAL_ALLOCATOR, prelude::*};
 

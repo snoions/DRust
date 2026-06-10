@@ -16,8 +16,13 @@ use tarpc::{
 use tokio::runtime::Runtime;
 
 use crate::{
-    app::{dataframe::prelude::Chunk, gemm::par_strassen::{par_strassen_mul, single_strassen_mul}, socialnet::media::Image}, dprintln, drun_server, drust_std::{alloc::LOCAL_ALLOCATOR, collections::dvec::*}
+    app::{dataframe::prelude::Chunk, gemm::par_strassen::{par_strassen_mul, single_strassen_mul}}, dprintln, drun_server, drust_std::{alloc::LOCAL_ALLOCATOR, collections::dvec::*}
 };
+
+#[cfg(feature = "socialnet")]
+use crate::app::socialnet::media::Image;
+#[cfg(not(feature = "socialnet"))]
+use crate::app::socialnet_stub::media::Image;
 
 #[tarpc::service]
 pub trait DRustWorld {
