@@ -1,6 +1,6 @@
 .PHONY: clean
 
-CFLAGS  := -Wall -Werror -g -Wno-unused-function
+CFLAGS  := -Wall -Werror -g -Wno-unused-function -fPIC
 LD      := gcc
 LDLIBS  := ${LDLIBS} -lrdmacm -libverbs -lpthread
 AFLAGS	:= rcs

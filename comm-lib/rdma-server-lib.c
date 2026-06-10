@@ -47,10 +47,10 @@ int drust_start_server(size_t heap_start, size_t heap_size, size_t server_id)
     cur_id++;
   }
 
-  size_t passive_ip_idx = NUM_SERVERS;
+  size_t passive_ip_idx = NUM_SERVERS - 1;
   // global_conn[server_id:NUM_SERVERS] are in reverse order of the servers
   // This is fixed during drust_server_ready
-  while (cur_id < NUM_SERVERS)
+  while (cur_id < NUM_SERVERS - 1)
   {
     // Connect to the servers backwards, starting from server[NUM_SERVERS-1]
     printf("passive_ip_idx: %lu\n", passive_ip_idx);
@@ -117,16 +117,16 @@ void make_active_connection(const char *passive_ip_str, const char *port_str)
 
 void make_passive_connection(const char *passive_ip_str, const char *port_str)
 {
-  struct sockaddr_in6 addr;
+  struct sockaddr_in addr;
   struct rdma_cm_event *event = NULL;
   struct rdma_cm_id *listener = NULL;
   struct rdma_event_channel *ec = NULL;
   uint16_t port = 0;
   memset(&addr, 0, sizeof(addr));
-  addr.sin6_family = AF_INET6;
-  inet_pton(AF_INET6, passive_ip_str, &addr.sin6_addr);
-  addr.sin6_port = htons(atoi(port_str));
-  inet_pton(AF_INET6, passive_ip_str, &addr.sin6_addr);
+  addr.sin_family = AF_INET;
+  inet_pton(AF_INET, passive_ip_str, &addr.sin_addr);
+  addr.sin_port = htons(atoi(port_str));
+  inet_pton(AF_INET, passive_ip_str, &addr.sin_addr);
 
   TEST_Z(ec = rdma_create_event_channel());
   TEST_NZ(rdma_create_id(ec, &listener, NULL, RDMA_PS_TCP));
@@ -149,7 +149,7 @@ void make_passive_connection(const char *passive_ip_str, const char *port_str)
 
 void drust_server_ready()
 {
-  for (int i = 0; i < NUM_SERVERS; ++i)
+  for (int i = 0; i < NUM_SERVERS-1; ++i)
   {
     while (!global_conn[i])
       ;
@@ -159,7 +159,7 @@ void drust_server_ready()
   // Here all global_conn elements are already assigned in build_connection,
   // but not yet accessed by drust_read or _write.
   // So they are safe to be moved.
-  int i = global_server_id, j = NUM_SERVERS - 1;
+  int i = global_server_id, j = NUM_SERVERS - 2;
   while (i < j)
   {
     struct rdma_cm_id *tmp = global_conn[i];
