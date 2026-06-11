@@ -2,6 +2,8 @@ pub mod test;
 pub mod gemm;
 pub mod dataframe;
 pub mod kv;
+pub mod feedgen;
+pub mod feedgen_rw;
 #[cfg(feature = "socialnet")]
 pub mod socialnet;
 #[cfg(not(feature = "socialnet"))]

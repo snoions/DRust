@@ -1,0 +1,296 @@
+#!/bin/bash
+#SBATCH --job-name=drust_kv
+#SBATCH --partition=free
+#SBATCH --nodes=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=7
+#SBATCH --mem-per-cpu=16G
+#SBATCH --time=00:30:00
+#SBATCH --constraint="intel,mlx5_ib"
+#SBATCH --output=jobs/%x_%j.out
+#SBATCH --error=jobs/%x_%j.err
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=yutong4@uci.edu
+
+# ── User config ───────────────────────────────────────────────────────────────
+APP="${1:-feedgen_rw}"
+DRUST_ROOT="$HOME/DRust_home/DRust"
+JOB_LOGS="$HOME/DRust_home/jobs"
+DRUST_BIN="$DRUST_ROOT/drust.out"
+DRUST_DIR="$DRUST_ROOT/drust"       # binary must be run from here (reads drust.json)
+
+# Ports used by drust.json (tarpc/tokio channels). Must be free on all nodes.
+PORT_APP=36758
+PORT_ALLOC=36759
+PORT_SAFEPOINT=36760
+
+# Base port for the RDMA mesh (hardcoded in rdma-server-lib.c).
+# Server i listens on RDMA_PORT_BASE+i. Must be free on all nodes.
+RDMA_PORT_BASE=9400
+
+# Network interface to use for IB. Adjust if your cluster uses a different name
+# (e.g. ib0, ibp..., mlx5_...). 'ip -o addr' on a node will show you.
+IB_IFACE="ibp59s0"
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+NUM_NODES=${SLURM_JOB_NUM_NODES}
+
+# ── 1. Collect IB IP addresses from all allocated nodes ───────────────────────
+#
+# CRITICAL: the IP ordering must match the node ordering used when launching
+# servers below. Servers are launched on explicit hostnames from NODE_HOSTS,
+# so we collect IPs in that same nodelist order (canonical order from
+# `scontrol show hostnames`). Ordering by SLURM_PROCID instead is NOT guaranteed
+# to match the nodelist order — when they differ, ip_str[i] holds a different
+# node's IP than the node server i runs on, so server i binds a non-local
+# address and rdma_bind_addr fails.
+#
+echo "=== Collecting node IPs ==="
+
+# Allocation hostnames in canonical nodelist order. server i -> NODE_HOSTS[i].
+mapfile -t NODE_HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+
+if [[ ${#NODE_HOSTS[@]} -ne $NUM_NODES ]]; then
+    echo "ERROR: expected $NUM_NODES hosts, got ${#NODE_HOSTS[@]}"
+    exit 1
+fi
+
+# Query each node's IPoIB IPv4 by hostname, in nodelist order, so NODE_IPS[i]
+# is the IP of the node that server i is launched on.
+NODE_IPS=()
+for i in "${!NODE_HOSTS[@]}"; do
+    HOST="${NODE_HOSTS[$i]}"
+    IP=$(srun --nodes=1 --nodelist="$HOST" bash -c '
+        IB_IFACE=""
+        for iface in /sys/class/net/*/type; do
+            if [[ "$(cat $iface)" == "32" ]]; then
+                IB_IFACE=$(basename $(dirname $iface))
+                break
+            fi
+        done
+        if [[ -z "$IB_IFACE" ]]; then
+            echo "ERROR: no IPoIB interface found on $(hostname)" >&2
+            exit 1
+        fi
+        IP=$(ip -o -4 addr show "$IB_IFACE" | awk "{print \$4}" | cut -d/ -f1)
+        if [[ -z "$IP" ]]; then
+            echo "ERROR: IPoIB interface $IB_IFACE has no IPv4 on $(hostname)" >&2
+            exit 1
+        fi
+        echo "$IP"
+    ')
+    if [[ -z "$IP" ]]; then
+        echo "ERROR: failed to get IPoIB IP for $HOST"
+        exit 1
+    fi
+    NODE_IPS+=("$IP")
+done
+
+if [[ ${#NODE_IPS[@]} -ne $NUM_NODES ]]; then
+    echo "ERROR: expected $NUM_NODES IPs, got ${#NODE_IPS[@]}"
+    exit 1
+fi
+
+echo "Node IP assignments (nodelist order = launch order):"
+for i in "${!NODE_IPS[@]}"; do
+    echo "  server $i -> ${NODE_HOSTS[$i]} = ${NODE_IPS[$i]}"
+done
+
+# ── 2. Write drust.json ───────────────────────────────────────────────────────
+#
+# The JSON is read from CWD at startup, so we write it into DRUST_DIR
+# which is also where we launch the binary from.
+# The file is on a shared filesystem so all nodes see the same copy.
+#
+echo "=== Writing drust.json ==="
+
+JSON_FILE="$DRUST_DIR/drust.json"
+[[ -f "$JSON_FILE" ]] && cp "$JSON_FILE" "${JSON_FILE}.bak.${SLURM_JOB_ID}"
+
+{
+  echo '{'
+  echo '  "servers": ['
+  for i in "${!NODE_IPS[@]}"; do
+    IP="${NODE_IPS[$i]}"
+    COMMA=$([[ $i -lt $((NUM_NODES - 1)) ]] && echo ',' || echo '')
+    cat <<EOF
+    {
+      "ip": "${IP}:${PORT_APP}",
+      "alloc_ip": "${IP}:${PORT_ALLOC}",
+      "safepoint_ip": "${IP}:${PORT_SAFEPOINT}"
+    }${COMMA}
+EOF
+  done
+  echo '  ]'
+  echo '}'
+} > "$JSON_FILE"
+
+echo "drust.json written:"
+cat "$JSON_FILE"
+
+echo "=== Patching node counts ==="
+
+# rdma-common.h: TOTAL_NUM_SERVERS = NUM_NODES + 1 (coordinator + workers)
+RDMA_COMMON_H="$DRUST_ROOT/comm-lib/rdma-common.h"
+cp "$RDMA_COMMON_H" "${RDMA_COMMON_H}.bak.${SLURM_JOB_ID}"
+sed -i "s/#define TOTAL_NUM_SERVERS [0-9]*/#define TOTAL_NUM_SERVERS $((NUM_NODES + 1))/" "$RDMA_COMMON_H"
+
+# conf.rs: NUM_SERVERS = NUM_NODES (number of data servers, excludes coordinator)
+CONF_RS="$DRUST_ROOT/drust/src/conf.rs"
+cp "$CONF_RS" "${CONF_RS}.bak.${SLURM_JOB_ID}"
+sed -i "s/pub const NUM_SERVERS: usize = [0-9]*/pub const NUM_SERVERS: usize = $NUM_NODES/" "$CONF_RS"
+
+# ── 3. Patch rdma-server-lib.c and recompile ─────────────────────────────────
+#
+# ip_str[] and port_str[] in rdma-server-lib.c are hardcoded and are the only
+# thing the RDMA layer uses to form the connection mesh — they are completely
+# independent of drust.json. We patch the source in-place, rebuild the C
+# static library, then re-link via cargo.
+#
+# The patched binary lives on the shared filesystem so all nodes pick it up
+# without any scp.
+#
+echo "=== Patching rdma-server-lib.c ==="
+
+RDMA_LIB="$DRUST_ROOT/comm-lib/rdma-server-lib.c"
+cp "$RDMA_LIB" "${RDMA_LIB}.bak.${SLURM_JOB_ID}"
+
+# Build the ip_str initializer: N node IPs + a sentinel entry (index NUM_SERVERS)
+# which drust_start_server uses as the "self" address for active connections.
+# The original hardcodes ip_str[NUM_SERVERS] == ip_str[0]; we do the same.
+IP_STR_ENTRIES=""
+for i in $(seq 0 $((NUM_NODES - 1))); do
+    IP_STR_ENTRIES="${IP_STR_ENTRIES}\"${NODE_IPS[$i]}\", "
+done
+# sentinel at ip_str[NUM_SERVERS]: first active target for server 0,
+# which is the highest-indexed server = NODE_IPS[NUM_NODES-1]
+IP_STR_ENTRIES="${IP_STR_ENTRIES}\"${NODE_IPS[$((NUM_NODES - 1))]}\""
+
+# Build the port_str initializer: server i listens on RDMA_PORT_BASE+i
+PORT_STR_ENTRIES=""
+for i in $(seq 0 $((NUM_NODES - 1))); do
+    SEP=$([[ $i -lt $((NUM_NODES - 1)) ]] && echo ", " || echo "")
+    PORT_STR_ENTRIES="${PORT_STR_ENTRIES}\"$((RDMA_PORT_BASE + i))\"${SEP}"
+done
+
+echo "Patched ip_str:   $IP_STR_ENTRIES"
+echo "Patched port_str: $PORT_STR_ENTRIES"
+
+# Replace both array literals using awk (avoids fragile sed escaping)
+awk \
+    -v ip_entries="$IP_STR_ENTRIES" \
+    -v port_entries="$PORT_STR_ENTRIES" \
+    -v num_nodes="$NUM_NODES" '
+    /const char \*ip_str\[/ {
+        print "  const char *ip_str[" num_nodes+1 "] = {" ip_entries "};"
+        next
+    }
+    /const char \*port_str\[/ {
+        print "  const char *port_str[" num_nodes "] = {" port_entries "};"
+        next
+    }
+    { print }
+' "${RDMA_LIB}.bak.${SLURM_JOB_ID}" > "$RDMA_LIB"
+
+echo "=== Rebuilding comm-lib and drust binary ==="
+
+cd "$DRUST_ROOT/comm-lib"
+make clean
+make -j lib
+cp libmyrdma.a "$DRUST_DIR/"
+
+cd "$DRUST_DIR"
+~/.cargo/bin/cargo build --release
+
+# copy_executable.sh convention: the runnable binary lives at $DRUST_ROOT/drust.out
+cp "$DRUST_ROOT/target/release/drust" "$DRUST_BIN"
+echo "Build complete: $DRUST_BIN"
+
+# ── 4 & 5. Launch workers + driver, wait for completion ──────────────────────
+
+#   - starts workers (server IDs 1..N-1) in the background
+#   - waits for them to initialize
+#   - runs the driver (server ID 0) synchronously
+#   - collects exit codes and prints any error logs
+#
+run_benchmark() {
+    local APP="$1"
+    echo ""
+    echo "=== Running benchmark: $APP ==="
+
+    # Use indexed arrays with a parallel server-id list to avoid
+    # associative array scoping issues inside functions.
+    local WORKER_SERVER_IDS=()
+    local WORKER_PIDS=()
+
+    for SERVER_ID in $(seq 1 $((NUM_NODES - 1))); do
+        srun \
+            --nodes=1 \
+            --nodelist="${NODE_HOSTS[$SERVER_ID]}" \
+            --output="${JOB_LOGS}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_server${SERVER_ID}_${APP}.out" \
+            --error="${JOB_LOGS}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_server${SERVER_ID}_${APP}.err" \
+            bash -c "cd '$DRUST_DIR' && RUST_BACKTRACE=full setarch \$(uname -m) -R '$DRUST_BIN' -s $SERVER_ID -a $APP" &
+        WORKER_SERVER_IDS+=($SERVER_ID)
+        WORKER_PIDS+=($!)
+    done
+
+
+    echo "Waiting 15 seconds for workers to start listening on RDMA ports..."
+    sleep 15 
+
+    srun \
+        --nodes=1 \
+        --nodelist="${NODE_HOSTS[0]}" \
+        --output="${JOB_LOGS}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_server0_${APP}.out" \
+        --error="${JOB_LOGS}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_server0_${APP}.err" \
+        bash -c "cd '$DRUST_DIR' && RUST_BACKTRACE=full setarch \$(uname -m) -R '$DRUST_BIN' -s 0 -a $APP"
+    local DRIVER_EXIT=$?
+
+    echo "=== Driver finished (exit $DRIVER_EXIT), waiting for workers to exit ==="
+
+    # Wait on each worker individually — do NOT use bare `wait` here as it
+    # reaps all children and makes subsequent `wait $PID` return 127.
+    local WORKER_FAILED=0
+    for idx in "${!WORKER_PIDS[@]}"; do
+        local PID=${WORKER_PIDS[$idx]}
+        local SERVER_ID=${WORKER_SERVER_IDS[$idx]}
+        wait "$PID"
+        local WEC=$?
+        if [[ $WEC -ne 0 ]]; then
+            echo "ERROR: worker server $SERVER_ID exited with code $WEC" >&2
+            echo "--- ${APP}_server${SERVER_ID}.err ---" >&2
+            cat "${SLURM_JOB_NAME}_${SLURM_JOB_ID}_${APP}_server${SERVER_ID}.err" >&2 || true
+            WORKER_FAILED=1
+        fi
+    done
+
+    if [[ $DRIVER_EXIT -ne 0 ]]; then
+        echo "--- ${APP}_server0.err ---" >&2
+        cat "${SLURM_JOB_NAME}_${SLURM_JOB_ID}_${APP}_server0.err" >&2 || true
+    fi
+
+    if [[ $DRIVER_EXIT -ne 0 || $WORKER_FAILED -ne 0 ]]; then
+        return 1
+    fi
+}
+
+run_benchmark $APP   || { echo "$APP benchmark failed" >&2; exit 1; }
+
+# ── 6. Restore original sources ───────────────────────────────────────────────
+if [[ -f "${RDMA_LIB}.bak.${SLURM_JOB_ID}" ]]; then
+    mv "${RDMA_LIB}.bak.${SLURM_JOB_ID}" "$RDMA_LIB"
+fi
+if [[ -f "${RDMA_COMMON_H}.bak.${SLURM_JOB_ID}" ]]; then
+    mv "${RDMA_COMMON_H}.bak.${SLURM_JOB_ID}" "$RDMA_COMMON_H"
+fi
+if [[ -f "${CONF_RS}.bak.${SLURM_JOB_ID}" ]]; then
+    mv "${CONF_RS}.bak.${SLURM_JOB_ID}" "$CONF_RS"
+fi
+if [[ -f "${JSON_FILE}.bak.${SLURM_JOB_ID}" ]]; then
+    mv "${JSON_FILE}.bak.${SLURM_JOB_ID}" "$JSON_FILE"
+fi
+
+echo "=== DRust kv benchmark complete ==="
+

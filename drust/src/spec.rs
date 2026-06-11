@@ -19,6 +19,7 @@ exclude!(AnyType, 7);
 exclude!(GlobalEntry, 6);
 exclude!((), 64);
 exclude!(Image, 21);
+exclude!(crate::app::feedgen_rw::entry::GlobalEntry, 22);
 
 
 impl<T> DRust for (DVec<T>, DVec<T>, DVec<T>) 
@@ -100,6 +101,10 @@ pub fn drop_vec_with_id(type_id: u32, addr: usize, capacity: usize, len: usize) 
         },
         21 => {
             let v = unsafe {Vec::from_raw_parts_in(addr as *mut Image, len, capacity, &LOCAL_ALLOCATOR)};
+            drop(v);
+        },
+        22 => {
+            let v = unsafe {Vec::from_raw_parts_in(addr as *mut crate::app::feedgen_rw::entry::GlobalEntry, len, capacity, &LOCAL_ALLOCATOR)};
             drop(v);
         },
         _ => {

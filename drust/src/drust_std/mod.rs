@@ -87,6 +87,10 @@ pub async fn drust_main(
             app::dataframe::run().await;
         } else if app == "kv" {
             app::kv::run().await;
+        } else if app == "feedgen" {
+            app::feedgen::run().await;
+        } else if app == "feedgen_rw" {
+            app::feedgen_rw::run().await;
         } else if app == "sn" {
             #[cfg(feature = "socialnet")]
             app::socialnet::run().await;
