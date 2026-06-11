@@ -59,11 +59,22 @@ pub async fn init_connections(alloc_server_addrs: [SocketAddr; NUM_SERVERS]) {
     let mut clients = Vec::new();
     for i in 0..NUM_SERVERS {
         dprintln!("Connecting to server {}", i);
-        let mut transport =
-            tarpc::serde_transport::tcp::connect(&alloc_server_addrs[i], Json::default);
-        transport.config_mut().max_frame_length(usize::MAX);
-        // let fut_transport = Runtime::new().unwrap().block_on(transport).expect("failed to connect");
-        let fut_transport = transport.await.expect("failed to connect");
+        let fut_transport = loop {
+            let mut transport = tarpc::serde_transport::tcp::connect(&alloc_server_addrs[i], Json::default);
+            transport.config_mut().max_frame_length(usize::MAX);
+            match transport.await {
+                Ok(t) => break t,
+                Err(e) => {
+                    println!("retry connect to alloc server {}: {}", i, e);
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        };
+        //let mut transport =
+        //    tarpc::serde_transport::tcp::connect(&alloc_server_addrs[i], Json::default);
+        //transport.config_mut().max_frame_length(usize::MAX);
+        //// let fut_transport = Runtime::new().unwrap().block_on(transport).expect("failed to connect");
+        //let fut_transport = transport.await.expect("failed to connect");
         let client =
             Arc::new(DAllocatorClient::new(client::Config::default(), fut_transport).spawn());
         clients.push(client);

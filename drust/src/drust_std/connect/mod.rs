@@ -54,9 +54,20 @@ macro_rules! dconnect {
     ($addr:expr, $vec:ident, $appClient:ident) => {
         let mut client_refs: Vec<Arc<$appClient>> = Vec::with_capacity(NUM_SERVERS);
         for i in 0..NUM_SERVERS {
-            let mut transport = tarpc::serde_transport::tcp::connect(&$addr[i], Json::default);
-            transport.config_mut().max_frame_length(usize::MAX);
-            let fut_transport = transport.await.expect("failed to connect");
+            let fut_transport = loop {
+                let mut transport = tarpc::serde_transport::tcp::connect(&$addr[i], Json::default);
+                transport.config_mut().max_frame_length(usize::MAX);
+                match transport.await {
+                    Ok(t) => break t,
+                    Err(e) => {
+                        println!("retry connect to alloc server {}: {}", i, e);
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+            };
+            //let mut transport = tarpc::serde_transport::tcp::connect(&$addr[i], Json::default);
+            //transport.config_mut().max_frame_length(usize::MAX);
+            //let fut_transport = transport.await.expect("failed to connect");
             let config = Config::default();
             client_refs.push(Arc::new($appClient::new(config, fut_transport).spawn()));
             println!("connected to server {}", i);
