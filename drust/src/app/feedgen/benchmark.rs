@@ -21,6 +21,7 @@ const NUM_ARRAY_ENTRIES: usize = 2 << 20;
 const GRAPH_STRIDE: usize = 64;
 const GRAPH_HOPS: usize = ARRAY_ENTRY_SIZE / GRAPH_STRIDE;
 const TRAVERSAL_INTERVAL: usize = 32;
+const NUM_ITERATIONS: usize = 10;
 
 type GraphNode = [u8; ARRAY_ENTRY_SIZE];
 
@@ -75,12 +76,26 @@ fn load_partition_keys(server: usize, thread: usize) -> Vec<usize> {
     keys
 }
 
-// Populate this thread's bucket range in one bulk RDMA write.
-pub async fn populate(map: MapRef<'_>, server: usize, thread: usize) {
-    let keys = load_partition_keys(server, thread);
-    let start_bucket = server * UNIT_BUCKET_NUM + thread * UNIT_THREAD_BUCKET_NUM;
-    let end_bucket = (start_bucket + UNIT_THREAD_BUCKET_NUM).min(BUCKET_NUM);
-    populate_range(&map, start_bucket, end_bucket, &keys, VALUE).await;
+// Populate the ENTIRE map on server 0 with a single local bulk write.
+// The map's canonical storage lives on server 0, so writing it here is a local
+// CPU copy (no RDMA) and produces a consistent map that every server then reads
+// via local_copy. Reads all return VALUE because every populated bucket is set.
+// Runs on server 0 only (dispatched to GLOBAL_HEAP_START).
+pub async fn populate_all(map: MapRef<'_>) {
+    // Read every key from the CSV and set its bucket to VALUE.
+    let csv_file = format!(
+        "{}/DRust_home/dataset/zipf.csv",
+        dirs::home_dir().unwrap().display()
+    );
+    let mut keys = vec![];
+    let mut rdr = csv::Reader::from_path(&csv_file).unwrap();
+    for result in rdr.records() {
+        let record = result.unwrap();
+        let key: usize = record[0].parse().unwrap();
+        keys.push(key);
+    }
+    // One bulk write covering the whole bucket space [0, BUCKET_NUM).
+    populate_range(&map, 0, BUCKET_NUM, &keys, VALUE).await;
 }
 
 
@@ -95,17 +110,24 @@ pub async fn benchmark(map: MapRef<'_>, server: usize, thread: usize, num_entrie
     let mut rng = StdRng::seed_from_u64(1);
     let rand_dist = Uniform::from(0u32..u32::MAX);
 
-    for (op_idx, key) in keys.into_iter().enumerate() {
-        let getv = get(&map, key).await;
-        if getv != VALUE {
-            panic!(
-                "Wrong value: server_idx={} key={} bucket={} got={:?} expected={:?}",
-                unsafe { crate::conf::SERVER_INDEX },
-                key, bucket(key), getv, VALUE
-            );
-        }
-        if op_idx % TRAVERSAL_INTERVAL == 0 {
-            traverse(graph, rand_dist.sample(&mut rng));
+    for _ in (0..NUM_ITERATIONS) {
+        for (op_idx, key) in keys.iter().enumerate() {
+            let getv = get(&map, *key).await;
+            if getv != VALUE {
+                let b = bucket(*key);
+                let start_bucket = server * UNIT_BUCKET_NUM + thread * UNIT_THREAD_BUCKET_NUM;
+                let end_bucket = (start_bucket + UNIT_THREAD_BUCKET_NUM).min(BUCKET_NUM);
+                let in_range = b >= start_bucket && b < end_bucket;
+                panic!(
+                    "Wrong value: server_idx={} server_arg={} thread={} key={} bucket={} \
+                     populate_range=[{},{}) in_range={} got={:?} expected={:?}",
+                    unsafe { crate::conf::SERVER_INDEX },
+                    server, thread, key, b, start_bucket, end_bucket, in_range, getv, VALUE
+                );
+            }
+            if op_idx % TRAVERSAL_INTERVAL == 0 {
+                traverse(graph, rand_dist.sample(&mut rng));
+            }
         }
     }
 
@@ -113,7 +135,7 @@ pub async fn benchmark(map: MapRef<'_>, server: usize, thread: usize, num_entrie
     println!(
         "Thread Local Elapsed Time: {:?}, throughput: {:?} Mops/s",
         duration,
-        (cnt as f64 / duration.as_secs_f64()) / 1000000.0
+        ((cnt as f64 * NUM_ITERATIONS as f64) / duration.as_secs_f64()) / 1000000.0
     );
     duration.as_nanos() as usize
 }
@@ -140,24 +162,13 @@ pub async fn zipf_bench() {
     println!("op_total={}", op_total);
 
     // ── Populate phase ────────────────────────────────────────────────────────
-    // Each (server, thread) task loads its own partition's keys and bulk-writes
-    // its bucket range. Dispatched per-server so the writing server is the one
-    // that later reads the range.
+    // Server 0 populates the entire map locally in one task. The map lives on
+    // server 0, so this is a local write with no cross-server RDMA write/read
+    // visibility gap. Every server then reads the consistent map via local_copy.
     let popstart = tokio::time::Instant::now();
-    let mut handles: Vec<JoinHandle<()>> = vec![];
-    for server in 0..NUM_SERVERS {
-        for thread in 0..THREAD_NUM {
-            let map_ref = map.as_dref();
-            let handle = dspawn_to(
-                populate(map_ref, server, thread),
-                GLOBAL_HEAP_START + server * WORKER_UNIT_SIZE,
-            );
-            handles.push(handle);
-        }
-    }
-    for handle in handles {
-        handle.await;
-    }
+    let map_ref = map.as_dref();
+    let handle: JoinHandle<()> = dspawn_to(populate_all(map_ref), GLOBAL_HEAP_START);
+    handle.await;
     println!("Populate Elapsed Time: {:?} seconds", popstart.elapsed());
 
     // ── Benchmark phase ───────────────────────────────────────────────────────
@@ -182,8 +193,8 @@ pub async fn zipf_bench() {
 
     let total_wall = start.elapsed();
     let avg_time = thread_times.iter().sum::<f64>() / thread_times.len() as f64;
-    // Aggregate throughput: all ops across all threads over the avg_time
-    let aggregate_throughput = (op_total as f64 / avg_time) / 1000000.0;
+    // Aggregate throughput: all ops across all threads over the wall-clock time.
+    let aggregate_throughput = ((op_total as f64 * NUM_ITERATIONS as f64) / avg_time) / 1000000.0;
     println!(
         "Average Thread Elapsed Time: {:?} seconds",
         avg_time
@@ -203,4 +214,3 @@ pub async fn zipf_bench() {
     writeln!(wrt_file, "Total Wall Time: {} seconds", total_wall.as_secs_f64()).expect("write");
     writeln!(wrt_file, "Aggregate Throughput: {} Mops/s", aggregate_throughput).expect("write");
 }
-

@@ -74,33 +74,41 @@ pub async fn populate_range(
 ) {
     let n = end_bucket - start_bucket;
 
-    // Local staging buffer for the whole range, zero-initialized.
+    // Bulk-write the whole range to the canonical map.
+    let dst_addr = map.orig_raw.0 + start_bucket * mem::size_of::<GlobalEntry>();
+    if current_place(dst_addr) == Destination::Local {
+        // Local home: write directly into the canonical map, no staging buffer.
+        // Zero the range first, then set populated buckets. Avoids a second
+        // multi-GB allocation on the home server.
+        unsafe {
+            let base = dst_addr as *mut GlobalEntry;
+            for i in 0..n {
+                *base.add(i) = GlobalEntry { key: 0, value: [0u8; 8] };
+            }
+            for &key in keys {
+                let b = bucket(key);
+                if b >= start_bucket && b < end_bucket {
+                    *base.add(b - start_bucket) = GlobalEntry { key, value };
+                }
+            }
+        }
+        return;
+    }
+
+    // Remote home: stage the range in a local buffer, then one bulk RDMA write.
     let mut buf: Vec<GlobalEntry, &good_memory_allocator::SpinLockedAllocator> =
         unsafe { Vec::with_capacity_in(n, &LOCAL_ALLOCATOR) };
     for _ in 0..n {
         buf.push(GlobalEntry { key: 0, value: [0u8; 8] });
     }
-
-    // Set the populated keys at their bucket offsets within the range.
     for &key in keys {
         let b = bucket(key);
         if b >= start_bucket && b < end_bucket {
             buf[b - start_bucket] = GlobalEntry { key, value };
         }
     }
-
-    // Bulk-write the whole range to the canonical map.
-    let dst_addr = map.orig_raw.0 + start_bucket * mem::size_of::<GlobalEntry>();
     let src_addr = buf.as_ptr() as usize;
-    if current_place(dst_addr) == Destination::Local {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                dst_addr as *mut GlobalEntry,
-                n,
-            );
-        }
-    } else {
+    {
         unsafe {
             drust_write_large_sync(
                 src_addr - LOCAL_HEAP_START,
@@ -111,4 +119,3 @@ pub async fn populate_range(
         }
     }
 }
-
